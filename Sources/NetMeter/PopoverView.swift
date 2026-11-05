@@ -1,8 +1,8 @@
 import SwiftUI
 import ServiceManagement
 
-private let downColor = Color(red: 0.20, green: 0.55, blue: 1.0)
-private let upColor = Color(red: 1.0, green: 0.55, blue: 0.15)
+let downColor = Color(red: 0.20, green: 0.55, blue: 1.0)
+let upColor = Color(red: 1.0, green: 0.55, blue: 0.15)
 
 struct PopoverView: View {
     @ObservedObject var meter: Meter
@@ -28,12 +28,28 @@ struct PopoverView: View {
             HStack {
                 Text("NetMeter").font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                FloatingGraphToggle()
                 Button("Quit") { NSApp.terminate(nil) }
                     .keyboardShortcut("q")
             }
         }
         .padding(12)
         .frame(width: 360)
+    }
+}
+
+/// Footer button that switches between the menu bar item and the floating window.
+struct FloatingGraphToggle: View {
+    @AppStorage(SettingsKey.floatingVisible) private var visible = false
+
+    var body: some View {
+        Button {
+            visible.toggle()
+        } label: {
+            Image(systemName: visible ? "menubar.rectangle" : "rectangle.on.rectangle")
+        }
+        .buttonStyle(.borderless)
+        .help(visible ? "Switch to menu bar" : "Switch to floating window")
     }
 }
 
@@ -266,6 +282,8 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.displayMode) private var mode = DisplayMode.stacked.rawValue
     @AppStorage(SettingsKey.networkType) private var networkType = NetworkType.external.rawValue
     @AppStorage(SettingsKey.ignoredProcesses) private var ignored = "com.eset."
+    @AppStorage(SettingsKey.floatingVisible) private var floatingVisible = false
+    @AppStorage(SettingsKey.floatingOpacity) private var floatingOpacity = 0.9
     @State private var ignoredDraft = ""
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
@@ -295,6 +313,17 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             .onAppear { ignoredDraft = ignored }
+            Section("Floating graph") {
+                Toggle("Floating window instead of menu bar", isOn: $floatingVisible)
+                HStack {
+                    Text("Opacity")
+                    Slider(value: $floatingOpacity, in: 0.2...1)
+                    Text("\(Int(floatingOpacity * 100))%")
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 34, alignment: .trailing)
+                }
+                .disabled(!floatingVisible)
+            }
             Toggle("Launch at login", isOn: $launchAtLogin)
                 .onChange(of: launchAtLogin) { enabled in
                     do {
@@ -310,6 +339,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(height: 320)
+        .frame(height: 420)
     }
 }

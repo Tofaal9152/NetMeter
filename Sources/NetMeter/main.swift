@@ -7,6 +7,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let meter = Meter()
+    private lazy var floatingGraph = FloatingGraphController(meter: meter) { [weak self] anchor, edge in
+        self?.togglePopover(from: anchor, edge: edge)
+    }
     private var eventMonitor: Any?
     private var defaultsObserver: NSObjectProtocol?
 
@@ -17,6 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SettingsKey.displayMode: DisplayMode.stacked.rawValue,
             SettingsKey.networkType: NetworkType.external.rawValue,
             SettingsKey.ignoredProcesses: "com.eset.",
+            SettingsKey.floatingVisible: false,
+            SettingsKey.floatingOpacity: 0.9,
         ])
 
         enableLaunchAtLoginOnFirstRun()
@@ -25,7 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.action = #selector(togglePopover(_:))
+            button.action = #selector(statusItemClicked(_:))
             button.target = self
             button.imagePosition = .imageOnly
         }
@@ -37,11 +42,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         meter.onTick = { [weak self] in self?.updateStatusItem() }
         meter.start()
         updateStatusItem()
+        applyDisplayMode()
 
         defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.settingsChanged() }
+            MainActor.assumeIsolated { self?.scheduleSettingsChanged() }
+        }
+    }
+
+    private var settingsChangePending = false
+
+    /// UserDefaults change notifications arrive synchronously, including from inside
+    /// AppKit: toggling `statusItem.isVisible` makes AppKit write its own
+    /// "NSStatusItem Visible…" default while still updating the item. Reacting inline
+    /// re-entered that update until the stack overflowed, so changes are coalesced and
+    /// handled once on the next run-loop pass.
+    private func scheduleSettingsChanged() {
+        guard !settingsChangePending else { return }
+        settingsChangePending = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                self?.settingsChangePending = false
+                self?.settingsChanged()
+            }
         }
     }
 
@@ -88,6 +112,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func settingsChanged() {
         meter.reconfigureIfNeeded()
         updateStatusItem()
+        applyDisplayMode()
+    }
+
+    /// The menu bar item and the floating window are alternative displays: exactly one
+    /// of them is visible, so the app is always reachable.
+    private func applyDisplayMode() {
+        let floating = UserDefaults.standard.bool(forKey: SettingsKey.floatingVisible)
+        if statusItem.isVisible == floating {
+            // The panel is anchored to whichever display is going away.
+            closePopover()
+            statusItem.isVisible = !floating
+        }
+        floatingGraph.sync()
+    }
+
+    /// Opening NetMeter again (Finder, Spotlight, Launchpad) brings the menu bar item
+    /// back, a way out if the floating window was moved off-screen or lost.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        UserDefaults.standard.set(false, forKey: SettingsKey.floatingVisible)
+        return false
     }
 
     private func updateStatusItem() {
@@ -104,11 +148,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.toolTip = "↓ \(Format.rate(meter.down, bits: bits))   ↑ \(Format.rate(meter.up, bits: bits))"
     }
 
-    @objc private func togglePopover(_ sender: Any?) {
+    @objc private func statusItemClicked(_ sender: Any?) {
+        if let button = statusItem.button { togglePopover(from: button) }
+    }
+
+    /// Shows the details panel under the menu bar item or next to the floating window.
+    private func togglePopover(from anchor: NSView, edge: NSRectEdge = .minY) {
         if popover.isShown {
             closePopover()
-        } else if let button = statusItem.button {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        } else {
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: edge)
             popover.contentViewController?.view.window?.makeKey()
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
                 MainActor.assumeIsolated { self?.closePopover() }

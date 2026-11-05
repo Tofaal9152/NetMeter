@@ -69,7 +69,7 @@ final class AppResolver {
         }
 
         // nettop truncates names; the executable path has the full one.
-        let execName = path.map { ($0 as NSString).lastPathComponent } ?? name
+        let execName = path.map(Self.displayExecName) ?? name
         let isSystem = path.map { $0.hasPrefix("/System/") || $0.hasPrefix("/usr/") } ?? true
         if let friendly = Self.knownServices[execName] {
             return Info(id: "svc:" + friendly, name: friendly + (isSystem ? " (macOS)" : ""),
@@ -77,6 +77,16 @@ final class AppResolver {
         }
         return Info(id: "proc:" + execName, name: execName, detail: nil,
                     icon: symbol(isSystem ? "gearshape.fill" : "terminal.fill"))
+    }
+
+    /// The executable's file name, except when it is only a version number (e.g.
+    /// ".../claude/versions/2.1.318"): then the nearest meaningful folder name.
+    private static func displayExecName(_ path: String) -> String {
+        let parts = path.split(separator: "/").map(String.init)
+        let isVersion: (String) -> Bool = { $0.allSatisfy { $0.isNumber || $0 == "." } }
+        let generic: Set<String> = ["versions", "bin", "current", "latest", "libexec"]
+        guard let last = parts.last, isVersion(last) else { return parts.last ?? path }
+        return parts.dropLast().reversed().first { !isVersion($0) && !generic.contains($0) } ?? last
     }
 
     private func executablePath(pid: Int32) -> String? {

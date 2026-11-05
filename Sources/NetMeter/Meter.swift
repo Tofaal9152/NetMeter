@@ -13,6 +13,8 @@ enum SettingsKey {
     static let displayMode = "displayMode"
     static let networkType = "networkType"
     static let ignoredProcesses = "ignoredProcesses"
+    static let floatingVisible = "floatingGraphVisible"
+    static let floatingOpacity = "floatingGraphOpacity"
 }
 
 enum DisplayMode: String, CaseIterable, Identifiable {
