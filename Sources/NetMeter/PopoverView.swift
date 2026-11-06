@@ -308,7 +308,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 3) {
                 TextField("Ignore processes", text: $ignoredDraft)
                     .onSubmit { ignored = ignoredDraft }
-                Text("Comma-separated name prefixes. Add antivirus/firewall filters that re-route traffic, or it is counted twice. Press Return to apply.")
+                Text("Comma-separated name prefixes hidden from the app list. Add antivirus/firewall filters that re-route other apps' traffic. Press Return to apply.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

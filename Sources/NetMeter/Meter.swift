@@ -72,8 +72,8 @@ final class Meter: ObservableObject {
     }
 
     func start() {
-        reader.onSample = { [weak self] bytesIn, bytesOut, processes in
-            self?.record(bytesIn: bytesIn, bytesOut: bytesOut, processes: processes)
+        reader.onSample = { [weak self] bytesIn, bytesOut, processes, seconds in
+            self?.record(bytesIn: bytesIn, bytesOut: bytesOut, processes: processes, seconds: seconds)
         }
         reader.start(interval: interval, type: networkType, ignoring: ignoredProcesses)
     }
@@ -98,8 +98,7 @@ final class Meter: ObservableObject {
 
     func save() { usage.save() }
 
-    private func record(bytesIn: UInt64, bytesOut: UInt64, processes: [ProcessDelta]) {
-        let seconds = Double(reader.interval)
+    private func record(bytesIn: UInt64, bytesOut: UInt64, processes: [ProcessDelta], seconds: Double) {
         topApps = rankApps(processes, seconds: seconds)
         down = Double(bytesIn) / seconds
         up = Double(bytesOut) / seconds

@@ -15,14 +15,6 @@ enum NetworkType: String, CaseIterable, Identifiable {
     }
 }
 
-/// Streams per-interval traffic totals from `/usr/bin/nettop`.
-///
-/// Why not interface counters (getifaddrs / NET_RT_IFLIST2)? On recent macOS the
-/// Wi-Fi receive path doesn't update `ifi_ibytes`, so download reads ~0 even though
-/// upload is correct. nettop counts bytes per network flow and sees both directions.
-///
-/// nettop holds its output in a buffer when writing to a pipe, so it runs on a pseudo-terminal,
-/// which makes it write each sample immediately.
 /// Bytes one process moved during a sample.
 struct ProcessDelta {
     let pid: Int32
@@ -31,30 +23,47 @@ struct ProcessDelta {
     var bytesOut: UInt64
 }
 
+/// Measures traffic by polling one-shot `/usr/bin/nettop` snapshots.
+///
+/// Why nettop: on recent macOS (at least with traffic filters such as ESET installed)
+/// the Wi-Fi interface's receive counter (`ifi_ibytes`) stays ~0, so interface
+/// counters can't measure download. nettop reports bytes per connection.
+///
+/// Why polling instead of `nettop -L 0` streaming: a streaming nettop receives every
+/// update for every connection and used ~125% CPU continuously, whatever the sample
+/// interval. A one-shot snapshot costs ~0.03 s of CPU, so ~3% at one per second.
+///
+/// How totals are computed: each connection row carries cumulative bytes; the
+/// difference from the previous snapshot is the traffic in between. Connections that
+/// a traffic filter re-routes appear with blank byte counts under the app, while the
+/// filter's own connections carry those bytes, so summing every row that has numbers
+/// counts all traffic once. Per-app rates come from the per-process rows, which also
+/// include re-routed traffic.
 @MainActor
 final class FlowStatsReader {
-    /// Called once per completed sample with bytes received / sent during that sample,
-    /// plus the per-process breakdown (only processes that moved data).
-    var onSample: ((_ bytesIn: UInt64, _ bytesOut: UInt64, _ processes: [ProcessDelta]) -> Void)?
-
-    private var process: Process?
-    private var master: FileHandle?
-    private var pending = ""
-    private var blockIn: UInt64 = 0
-    private var blockOut: UInt64 = 0
-    private var blockProcs: [ProcessDelta] = []
-    private var blockHasRows = false
-    private var sawHeader = false
-    private var blocksSeen = 0
-    private var flushWork: DispatchWorkItem?
-    private var generation = 0
+    /// Called once per sample with bytes received / sent since the previous sample,
+    /// the per-process breakdown (only processes that moved data, ignored ones
+    /// excluded) and the seconds the sample covers.
+    var onSample: ((_ bytesIn: UInt64, _ bytesOut: UInt64, _ processes: [ProcessDelta],
+                    _ seconds: Double) -> Void)?
 
     private(set) var interval = 1
     private(set) var type = NetworkType.external
-    /// Process-name prefixes left out of the sum. Security tools that filter traffic
-    /// (e.g. ESET) re-send every byte through their own connections, so their flows
-    /// duplicate the originating app's and would double the totals.
+    /// Process-name prefixes hidden from the per-app list. Traffic filters (e.g. ESET)
+    /// re-send other apps' traffic; their connections still count toward the totals.
     private(set) var ignoredPrefixes: [String] = []
+
+    private var timer: Timer?
+    private var running: Process?
+    private var generation = 0
+
+    /// Last cumulative (in, out) per connection / process, kept for a while after it
+    /// disappears so a row that drops out of one snapshot and returns isn't recounted.
+    private struct Seen { var bytesIn: UInt64; var bytesOut: UInt64; var lastSeen: TimeInterval }
+    private var flows: [String: Seen] = [:]
+    private var procs: [String: Seen] = [:]
+    private var lastSnapshotTime: TimeInterval?
+    private static let forgetAfter: TimeInterval = 600
 
     func start(interval: Int, type: NetworkType, ignoring ignored: [String]) {
         stop()
@@ -62,148 +71,122 @@ final class FlowStatsReader {
         self.type = type
         self.ignoredPrefixes = ignored
         generation += 1
-        let gen = generation
-
-        var masterFD: Int32 = 0
-        var slaveFD: Int32 = 0
-        guard openpty(&masterFD, &slaveFD, nil, nil, nil) == 0 else {
-            NSLog("NetMeter: openpty failed: \(errno)")
-            return
+        poll() // baseline snapshot
+        let t = Timer(timeInterval: TimeInterval(self.interval), repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.poll() }
         }
-        // Raw-ish output: no CR translation or echo.
-        var tio = termios()
-        tcgetattr(slaveFD, &tio)
-        tio.c_oflag &= ~tcflag_t(OPOST)
-        tio.c_lflag &= ~tcflag_t(ECHO | ICANON)
-        tcsetattr(slaveFD, TCSANOW, &tio)
+        t.tolerance = 0.1
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
 
+    func stop() {
+        generation += 1
+        timer?.invalidate()
+        timer = nil
+        if let p = running, p.isRunning { p.terminate() }
+        running = nil
+        flows.removeAll()
+        procs.removeAll()
+        lastSnapshotTime = nil
+    }
+
+    // MARK: Snapshot
+
+    private func poll() {
+        guard running == nil else { return } // previous snapshot still running; skip
+        let gen = generation
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
-        p.arguments = ["-P", "-d", "-L", "0", "-s", String(self.interval), "-x", "-n",
-                       "-t", type.rawValue, "-J", "bytes_in,bytes_out"]
-        let slave = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: true)
-        p.standardOutput = slave
+        p.arguments = ["-L", "1", "-x", "-n", "-t", type.rawValue, "-J", "bytes_in,bytes_out"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
         p.standardInput = FileHandle.nullDevice
-        p.terminationHandler = { [weak self] _ in
-            // Restart if nettop dies unexpectedly (not when we stopped it ourselves).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                MainActor.assumeIsolated {
-                    guard let self, self.generation == gen else { return }
-                    self.start(interval: self.interval, type: self.type, ignoring: self.ignoredPrefixes)
-                }
-            }
-        }
-
-        let masterHandle = FileHandle(fileDescriptor: masterFD, closeOnDealloc: true)
-        masterHandle.readabilityHandler = { [weak self] h in
-            let data = h.availableData
-            guard !data.isEmpty else {
-                h.readabilityHandler = nil // EOF: nettop exited
-                return
-            }
-            let text = String(decoding: data, as: UTF8.self)
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    guard let self, self.generation == gen else { return }
-                    self.consume(text)
-                }
-            }
-        }
+        running = p
 
         do {
             try p.run()
         } catch {
             NSLog("NetMeter: failed to launch nettop: \(error)")
-            masterHandle.readabilityHandler = nil
+            running = nil
             return
         }
-        try? slave.close() // child keeps its own copy
-        process = p
-        master = masterHandle
-    }
-
-    func stop() {
-        generation += 1
-        flushWork?.cancel()
-        master?.readabilityHandler = nil
-        if let p = process, p.isRunning { p.terminate() }
-        process = nil
-        master = nil
-        pending = ""
-        blockIn = 0
-        blockOut = 0
-        blockProcs = []
-        blockHasRows = false
-        sawHeader = false
-        blocksSeen = 0
-    }
-
-    private func consume(_ text: String) {
-        pending += text
-        while let nl = pending.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
-            let line = String(pending[..<nl])
-            pending.removeSubrange(...nl)
-            handle(line: line)
-        }
-        // A sample is written in one burst; once output goes quiet, the block is complete.
-        flushWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated { self?.finishBlock() }
-        }
-        flushWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
-    }
-
-    private func handle(line raw: String) {
-        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters))
-        guard !line.isEmpty else { return }
-        if line.hasPrefix(",bytes_in") || line.hasPrefix("bytes_in") {
-            finishBlock()
-            sawHeader = true
-            return
-        }
-        // Rows look like "process.pid,123,456," — the process name may contain commas,
-        // so take the last two numeric fields.
-        var fields = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
-        if fields.last == "" { fields.removeLast() }
-        guard fields.count >= 3,
-              let inBytes = Int64(fields[fields.count - 2]),
-              let outBytes = Int64(fields[fields.count - 1]) else { return }
-        let process = fields[..<(fields.count - 2)].joined(separator: ",")
-        if ignoredPrefixes.contains(where: { process.hasPrefix($0) }) { return }
-        let i = UInt64(max(0, inBytes))
-        let o = UInt64(max(0, outBytes))
-        blockIn &+= i
-        blockOut &+= o
-        blockHasRows = true
-        if i > 0 || o > 0 {
-            // "name.pid" — split at the last dot.
-            var pid: Int32 = 0
-            var name = process
-            if let dot = process.lastIndex(of: "."), let n = Int32(process[process.index(after: dot)...]) {
-                pid = n
-                name = String(process[..<dot])
+        // nettop exits after one snapshot; read its whole output off the main thread.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let text = String(decoding: data, as: UTF8.self)
+            let now = ProcessInfo.processInfo.systemUptime
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.generation == gen else { return }
+                    self.running = nil
+                    self.ingest(text, at: now)
+                }
             }
-            blockProcs.append(ProcessDelta(pid: pid, name: name, bytesIn: i, bytesOut: o))
         }
     }
 
-    private func finishBlock() {
-        flushWork?.cancel()
-        flushWork = nil
-        guard blockHasRows || sawHeader else { return }
-        let (i, o, procs) = (blockIn, blockOut, blockProcs)
-        blockIn = 0
-        blockOut = 0
-        blockProcs = []
-        blockHasRows = false
-        sawHeader = false
-        blocksSeen += 1
-        // In delta mode (-d) the first sample is the running total since each flow
-        // started, not a per-interval delta, so it is discarded.
-        guard blocksSeen > 1 else { return }
-        onSample?(i, o, procs)
+    private func ingest(_ text: String, at now: TimeInterval) {
+        var totalIn: UInt64 = 0
+        var totalOut: UInt64 = 0
+        var perProcess: [ProcessDelta] = []
+        var process = ""
+
+        for line in text.split(separator: "\n") {
+            // Rows: "<process.pid or connection>,<bytes_in>,<bytes_out>,". Process names
+            // may contain commas, so take the last two numeric fields.
+            var fields = line.split(separator: ",", omittingEmptySubsequences: false)
+            if fields.last?.isEmpty == true { fields.removeLast() }
+            guard fields.count >= 3 else { continue }
+            let name = fields[..<(fields.count - 2)].joined(separator: ",")
+            let inField = fields[fields.count - 2], outField = fields[fields.count - 1]
+            if name.isEmpty { continue } // header row
+
+            if name.contains("<->") {
+                // Connection row; blank counts mean a filter re-routes it (see above).
+                guard let i = UInt64(inField), let o = UInt64(outField) else { continue }
+                let (di, dout) = delta(for: process + "|" + name, i, o, in: &flows, now: now)
+                totalIn &+= di
+                totalOut &+= dout
+            } else {
+                process = name
+                guard let i = UInt64(inField), let o = UInt64(outField) else { continue }
+                let (di, dout) = delta(for: name, i, o, in: &procs, now: now,
+                                       countDropAsNew: false)
+                guard di > 0 || dout > 0,
+                      !ignoredPrefixes.contains(where: { name.hasPrefix($0) }) else { continue }
+                var pid: Int32 = 0
+                var procName = name
+                if let dot = name.lastIndex(of: "."), let n = Int32(name[name.index(after: dot)...]) {
+                    pid = n
+                    procName = String(name[..<dot])
+                }
+                perProcess.append(ProcessDelta(pid: pid, name: procName, bytesIn: di, bytesOut: dout))
+            }
+        }
+
+        flows = flows.filter { now - $0.value.lastSeen < Self.forgetAfter }
+        procs = procs.filter { now - $0.value.lastSeen < Self.forgetAfter }
+
+        defer { lastSnapshotTime = now }
+        guard let last = lastSnapshotTime else { return } // first snapshot is the baseline
+        onSample?(totalIn, totalOut, perProcess, max(now - last, 0.1))
+    }
+
+    /// Bytes moved since this row was last seen.
+    /// - countDropAsNew: for a connection, a smaller value means a new connection reused
+    ///   the same addresses, so all of it is new. A process total also shrinks when one
+    ///   of its connections closes; there the drop is just ignored.
+    private func delta(for key: String, _ i: UInt64, _ o: UInt64, in table: inout [String: Seen],
+                       now: TimeInterval, countDropAsNew: Bool = true) -> (UInt64, UInt64) {
+        defer { table[key] = Seen(bytesIn: i, bytesOut: o, lastSeen: now) }
+        guard lastSnapshotTime != nil else { return (0, 0) } // building the baseline
+        guard let prev = table[key] else { return (i, o) }    // appeared since last snapshot
+        let di = i >= prev.bytesIn ? i - prev.bytesIn : (countDropAsNew ? i : 0)
+        let dout = o >= prev.bytesOut ? o - prev.bytesOut : (countDropAsNew ? o : 0)
+        return (di, dout)
     }
 }
 
