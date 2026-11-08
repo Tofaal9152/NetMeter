@@ -2,6 +2,33 @@
 
 A lightweight macOS menu bar app that shows your internet speed, inspired by DU Meter.
 
+<p>
+  <img src="docs/screenshots/menubar.png" width="90" alt="NetMeter in the menu bar showing upload 0.4 KB/s and download 5.3 KB/s">
+</p>
+
+<table>
+  <tr>
+    <td align="center" valign="top">
+      <img src="docs/screenshots/live.png" width="320" alt="Live tab: download and upload speeds with peaks, a 2-minute graph, and the apps using the network">
+      <br><sub><b>Live</b>: speeds, graph and the apps using the network</sub>
+    </td>
+    <td align="center" valign="top">
+      <img src="docs/screenshots/usage.png" width="320" alt="Usage tab: session, today and this month totals, and a 14-day bar chart">
+      <br><sub><b>Usage</b>: session, today, this month and the last 14 days</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="top">
+      <img src="docs/screenshots/floating.png" width="201" alt="Floating graph window with live speeds and a graph">
+      <br><sub><b>Floating graph</b>: an always-on-top alternative to the menu bar</sub>
+    </td>
+    <td align="center" valign="top">
+      <img src="docs/screenshots/settings.png" width="280" alt="Settings tab: menu bar style, units, update interval, network type, ignored processes, floating graph and launch at login">
+      <br><sub><b>Settings</b></sub>
+    </td>
+  </tr>
+</table>
+
 - **Live speeds in the menu bar.** Upload and download, stacked or on one line, in bytes (MB/s) or bits (Mbps).
 - **Details panel.** Click the menu bar item for current and peak speeds, a 2-minute graph, and the **apps using the network** right now.
 - **Usage history.** Totals for this session, today and this month, plus a 14-day chart. Stored only on your Mac.
