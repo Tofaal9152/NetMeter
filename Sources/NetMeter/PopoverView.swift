@@ -158,13 +158,19 @@ struct SpeedGraph: View {
     let capacity: Int
     let bits: Bool
 
+    /// Height kept clear above the plot for the scale label (caption2 + padding).
+    static let labelHeadroom: CGFloat = 20
+
     var body: some View {
         let maxValue = max(samples.map { max($0.down, $0.up) }.max() ?? 0, 1000)
         ZStack(alignment: .topLeading) {
             Canvas { ctx, size in
-                // Grid
-                for i in 1..<4 {
-                    let y = size.height * CGFloat(i) / 4
+                // The top strip is reserved for the scale label, so peaks never run
+                // into it; the plot's top gridline is the label's value.
+                let top = Self.labelHeadroom
+                let plotHeight = max(size.height - top, 1)
+                for i in 0..<4 {
+                    let y = top + plotHeight * CGFloat(i) / 4
                     var p = Path()
                     p.move(to: CGPoint(x: 0, y: y))
                     p.addLine(to: CGPoint(x: size.width, y: y))
@@ -176,7 +182,7 @@ struct SpeedGraph: View {
 
                 func point(_ i: Int, _ v: Double) -> CGPoint {
                     CGPoint(x: startX + CGFloat(i) * step,
-                            y: size.height - CGFloat(v / maxValue) * (size.height - 4))
+                            y: size.height - CGFloat(v / maxValue) * plotHeight)
                 }
 
                 var area = Path()
@@ -339,6 +345,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(height: 420)
+        .frame(height: 470) // tall enough that the last row (Launch at login) isn't cut off
     }
 }
