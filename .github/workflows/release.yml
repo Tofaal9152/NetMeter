@@ -1,0 +1,61 @@
+name: Build & Release
+
+# Push a tag like v1.2.0 to build NetMeter-1.2.0.dmg and publish it as a GitHub
+# Release. "Run workflow" (manual) builds the DMG as a downloadable artifact only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: build number = commit count
+
+      - name: Toolchain
+        run: swift --version
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=0.0.0-dev.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build DMG
+        run: ./make-dmg.sh
+
+      - name: Checksum
+        run: |
+          cd build
+          shasum -a 256 "NetMeter-$VERSION.dmg" > "NetMeter-$VERSION.dmg.sha256"
+          cat "NetMeter-$VERSION.dmg.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetMeter-${{ env.VERSION }}
+          path: |
+            build/NetMeter-${{ env.VERSION }}.dmg
+            build/NetMeter-${{ env.VERSION }}.dmg.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "build/NetMeter-$VERSION.dmg" \
+            "build/NetMeter-$VERSION.dmg.sha256" \
+            --title "NetMeter $VERSION" \
+            --generate-notes \
+            --notes "Download **NetMeter-$VERSION.dmg**, open it and drag NetMeter to Applications.
+
+          NetMeter isn't notarized by Apple, so the first launch needs one extra step: open it once, then go to **System Settings → Privacy & Security** and click **Open Anyway**. See the [README](https://github.com/${{ github.repository }}#install) for details."
