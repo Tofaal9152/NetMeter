@@ -224,7 +224,7 @@ struct UsageView: View {
     var body: some View {
         let today = usage.today
         let month = usage.thisMonth
-        let days = usage.recentDays(14)
+        let days = usage.recentDays(UsageStore.appHistoryDays)
         let maxDay = max(days.map { $0.down + $0.up }.max() ?? 0, 1)
 
         VStack(alignment: .leading, spacing: 10) {
@@ -257,13 +257,15 @@ struct UsageView: View {
             .padding(6)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
 
+            AppUsageHistoryView(usage: usage)
+
             HStack {
                 Spacer()
                 Button("Reset usage history…") { confirmReset = true }
                     .controlSize(.small)
             }
         }
-        .confirmationDialog("Erase all stored daily usage?", isPresented: $confirmReset) {
+        .confirmationDialog("Erase all stored usage, including per-app history?", isPresented: $confirmReset) {
             Button("Erase", role: .destructive) { usage.resetAll() }
         }
     }
@@ -276,6 +278,64 @@ struct UsageView: View {
             Text(Format.bytes(up)).font(.callout.monospacedDigit())
             Text(Format.bytes(down &+ up)).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct AppUsageHistoryView: View {
+    @ObservedObject var usage: UsageStore
+    @State private var period = 1
+
+    var body: some View {
+        let apps = usage.topApps(forLastDays: period)
+        let rowHeight: CGFloat = 22
+
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Top apps").font(.caption).foregroundStyle(.secondary)
+                    .help("Estimated traffic by app, recorded by this version of NetMeter.")
+                Spacer()
+                Picker("App usage period", selection: $period) {
+                    Text("Today").tag(1)
+                    Text("Last 14 days").tag(UsageStore.appHistoryDays)
+                }
+                .labelsHidden()
+                .controlSize(.small)
+                .fixedSize()
+            }
+            if apps.isEmpty {
+                Text("No app usage recorded for this period.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                row("App", "Download", "Upload", "Total")
+                    .foregroundStyle(.secondary)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(apps) { app in
+                            row(app.name, Format.bytes(app.down), Format.bytes(app.up), Format.bytes(app.total))
+                                .frame(height: rowHeight)
+                        }
+                    }
+                }
+                .frame(height: rowHeight * CGFloat(min(apps.count, 5)))
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func row(_ name: String, _ download: String, _ upload: String, _ total: String) -> some View {
+        HStack(spacing: 8) {
+            Text(name)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(name)
+            Text(download).foregroundStyle(downColor).frame(width: 64, alignment: .trailing)
+            Text(upload).foregroundStyle(upColor).frame(width: 64, alignment: .trailing)
+            Text(total).frame(width: 64, alignment: .trailing)
+        }
+        .font(.caption.monospacedDigit())
+        .lineLimit(1)
+        .padding(.trailing, 8)
     }
 }
 

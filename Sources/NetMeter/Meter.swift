@@ -7,6 +7,21 @@ struct Sample: Identifiable {
     let up: Double
 }
 
+struct AppUsageTotal: Codable, Identifiable {
+    let id: String
+    var name: String
+    var down: UInt64 = 0
+    var up: UInt64 = 0
+
+    var total: UInt64 { down &+ up }
+
+    mutating func add(_ sample: AppUsageTotal) {
+        name = sample.name
+        down &+= sample.down
+        up &+= sample.up
+    }
+}
+
 enum SettingsKey {
     static let interval = "updateInterval"
     static let useBits = "useBits"
@@ -99,14 +114,21 @@ final class Meter: ObservableObject {
     func save() { usage.save() }
 
     private func record(bytesIn: UInt64, bytesOut: UInt64, processes: [ProcessDelta], seconds: Double) {
-        topApps = rankApps(processes, seconds: seconds)
+        let apps = groupApps(processes)
+        let rates = apps.map { info, bytes in
+            AppUsage(id: info.id, name: info.name, detail: info.detail, icon: info.icon,
+                     down: Double(bytes.down) / seconds, up: Double(bytes.up) / seconds)
+        }
+        let active = rates.filter { $0.down + $0.up >= 100 } // below this the row would read "0.0 KB/s"
+        let ranked = active.sorted { ($0.down + $0.up, $0.name) > ($1.down + $1.up, $1.name) }
+        topApps = Array(ranked.prefix(Self.topAppsCount))
         down = Double(bytesIn) / seconds
         up = Double(bytesOut) / seconds
         peakDown = max(peakDown, down)
         peakUp = max(peakUp, up)
         sessionDown &+= bytesIn
         sessionUp &+= bytesOut
-        usage.add(down: bytesIn, up: bytesOut)
+        usage.add(down: bytesIn, up: bytesOut, apps: apps.map(\.bytes))
 
         sampleID += 1
         history.append(Sample(id: sampleID, down: down, up: up))
@@ -123,30 +145,30 @@ final class Meter: ObservableObject {
         onTick?()
     }
 
-    private func rankApps(_ processes: [ProcessDelta], seconds: Double) -> [AppUsage] {
-        var groups: [String: AppUsage] = [:]
+    private func groupApps(_ processes: [ProcessDelta]) -> [(info: AppResolver.Info, bytes: AppUsageTotal)] {
+        var groups: [String: (AppResolver.Info, AppUsageTotal)] = [:]
         for p in processes {
             let info = resolver.info(pid: p.pid, name: p.name)
-            var row = groups[info.id] ?? AppUsage(id: info.id, name: info.name, detail: info.detail,
-                                                  icon: info.icon, down: 0, up: 0)
-            row.down += Double(p.bytesIn) / seconds
-            row.up += Double(p.bytesOut) / seconds
-            groups[info.id] = row
+            var bytes = groups[info.id]?.1 ?? AppUsageTotal(id: info.id, name: info.name)
+            bytes.down &+= p.bytesIn
+            bytes.up &+= p.bytesOut
+            groups[info.id] = (info, bytes)
         }
-        return groups.values
-            .filter { $0.down + $0.up >= 100 } // below this the row would read "0.0 KB/s"
-            .sorted { ($0.down + $0.up, $0.name) > ($1.down + $1.up, $1.name) }
-            .prefix(Self.topAppsCount)
-            .map { $0 }
+        return Array(groups.values)
     }
 }
 
 /// Persists per-day byte totals in UserDefaults.
 @MainActor
 final class UsageStore: ObservableObject {
+    static let appHistoryDays = 14
+
+    private let defaults: UserDefaults
     private let key = "dailyUsage"
+    private let appKey = "dailyAppUsage"
     private let keepDays = 400
     @Published private(set) var days: [String: [UInt64]] = [:] // "yyyy-MM-dd": [down, up]
+    @Published private var appDays: [String: [String: AppUsageTotal]] = [:]
 
     private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -155,21 +177,34 @@ final class UsageStore: ObservableObject {
         return f
     }()
 
-    init() {
-        if let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: [NSNumber]] {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let stored = defaults.dictionary(forKey: key) as? [String: [NSNumber]] {
             days = stored.mapValues { $0.map(\.uint64Value) }
+        }
+        if let data = defaults.data(forKey: appKey),
+           let stored = try? JSONDecoder().decode([String: [String: AppUsageTotal]].self, from: data) {
+            appDays = stored
         }
     }
 
     static func dayKey(_ date: Date = Date()) -> String { dayFormatter.string(from: date) }
 
-    func add(down: UInt64, up: UInt64) {
-        guard down > 0 || up > 0 else { return }
+    func add(down: UInt64, up: UInt64, apps: [AppUsageTotal]) {
         let k = Self.dayKey()
-        var v = days[k] ?? [0, 0]
-        v[0] &+= down
-        v[1] &+= up
-        days[k] = v
+        if down > 0 || up > 0 {
+            var v = days[k] ?? [0, 0]
+            v[0] &+= down
+            v[1] &+= up
+            days[k] = v
+        }
+        if !apps.isEmpty {
+            var totals = appDays[k] ?? [:]
+            for app in apps {
+                totals[app.id, default: AppUsageTotal(id: app.id, name: app.name)].add(app)
+            }
+            appDays[k] = totals
+        }
     }
 
     var today: (down: UInt64, up: UInt64) {
@@ -186,17 +221,36 @@ final class UsageStore: ObservableObject {
 
     /// Last `count` days, oldest first, including today.
     func recentDays(_ count: Int) -> [(day: String, down: UInt64, up: UInt64)] {
-        let cal = Calendar.current
-        return (0..<count).reversed().map { offset in
-            let date = cal.date(byAdding: .day, value: -offset, to: Date())!
-            let k = Self.dayKey(date)
+        Self.recentDayKeys(count).map { k in
             let v = days[k] ?? [0, 0]
             return (k, v[0], v[1])
         }
     }
 
+    func topApps(forLastDays count: Int) -> [AppUsageTotal] {
+        var totals: [String: AppUsageTotal] = [:]
+        for day in Self.recentDayKeys(count) {
+            for app in appDays[day, default: [:]].values {
+                totals[app.id, default: AppUsageTotal(id: app.id, name: app.name)].add(app)
+            }
+        }
+        return totals.values.sorted {
+            if $0.total != $1.total { return $0.total > $1.total }
+            return ($0.name, $0.id) < ($1.name, $1.id)
+        }
+    }
+
+    private static func recentDayKeys(_ count: Int) -> [String] {
+        let cal = Calendar.current
+        let now = Date()
+        return (0..<count).reversed().map { offset in
+            Self.dayKey(cal.date(byAdding: .day, value: -offset, to: now)!)
+        }
+    }
+
     func resetAll() {
         days.removeAll()
+        appDays.removeAll()
         save()
     }
 
@@ -205,6 +259,13 @@ final class UsageStore: ObservableObject {
         if sorted.count > keepDays {
             for k in sorted.prefix(sorted.count - keepDays) { days.removeValue(forKey: k) }
         }
-        UserDefaults.standard.set(days.mapValues { $0.map { NSNumber(value: $0) } }, forKey: key)
+        defaults.set(days.mapValues { $0.map { NSNumber(value: $0) } }, forKey: key)
+        let retained = Set(Self.recentDayKeys(Self.appHistoryDays))
+        if appDays.keys.contains(where: { !retained.contains($0) }) {
+            appDays = appDays.filter { retained.contains($0.key) }
+        }
+        if let data = try? JSONEncoder().encode(appDays) {
+            defaults.set(data, forKey: appKey)
+        }
     }
 }
